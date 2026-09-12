@@ -208,8 +208,7 @@ fn run_windows_image_patcher_inner() -> Result<()> {
     println!("开始修补，请勿关闭窗口...\n");
 
     let source_hash = sha256::digest(
-        std::fs::read(&image)
-            .with_context(|| format!("无法读取镜像：{}", image.display()))?,
+        std::fs::read(&image).with_context(|| format!("无法读取镜像：{}", image.display()))?,
     );
     crate::boot_patch::patch_local_image(
         image.clone(),
