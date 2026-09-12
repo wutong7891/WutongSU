@@ -1,0 +1,22 @@
+WutongSU v3.3.0 镜像修补工具
+
+Windows：
+1. 双击“WutongSU镜像工坊.exe”。
+2. 输入与设备匹配的 KMI 序号并回车。
+3. 在弹出的窗口中选择原始 boot.img 或 init_boot.img。
+4. 工具会在原始镜像同目录创建“年.月.日.时.分”文件夹，保存修补镜像和 SHA256.txt。
+
+Android：
+1. 安装“WutongSU-image-patcher-arm64.apk”。
+2. 选择内核版本和原始 boot/init_boot 镜像，然后点“开始修补”。
+3. 输出保存在“内部存储/Download/WutongSU”。
+
+KMI 对照：
+Android 12：5.10
+Android 13：5.10、5.15
+Android 14：5.15、6.1
+Android 15：6.6
+Android 16：6.12
+Android 17：6.18
+
+注意：必须按设备实际 Android/KMI 选择，选错可能无法启动。工具只生成镜像，不会自动连接或刷写设备。刷写前请保留原厂镜像及可用的救砖方式。
