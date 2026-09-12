@@ -1,0 +1,159 @@
+name: Build WutongSU manager and Android 16 6.12 KMI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-ksud:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Setup Rust and cargo-ndk
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk --locked
+
+      - name: Setup Android NDK r29
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Check, lint and format ksud
+        working-directory: userspace/ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a check
+          cargo ndk -t arm64-v8a clippy -- -D warnings
+          cargo fmt
+          git diff --exit-code
+
+  build-ksuinit:
+    uses: ./.github/workflows/ksuinit.yml
+
+  build-ksud-arm64:
+    needs: [validate-ksud, build-ksuinit]
+    uses: ./.github/workflows/ksud.yml
+    with:
+      target: aarch64-linux-android
+      pack_lkm: false
+      pack_ksuinit: true
+
+  build-manager:
+    needs: build-ksud-arm64
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: manager
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download ARM64 ksud
+        uses: actions/download-artifact@v8
+        with:
+          name: ksud-aarch64-linux-android
+          path: manager/ksud-artifact
+
+      - name: Install matching ksud into APK
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          KSUD="$(find ksud-artifact -type f -name ksud | head -n 1)"
+          test -n "$KSUD"
+          cp -f "$KSUD" app/src/main/jniLibs/arm64-v8a/libksud.so
+
+      - name: Restore dedicated signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE }}
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS_VALUE: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD_VALUE: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_B64"
+          printf '%s' "$KEYSTORE_B64" | base64 -d > key.jks
+          {
+            echo "KEYSTORE_FILE=key.jks"
+            echo "KEYSTORE_PASSWORD=$STORE_PASSWORD"
+            echo "KEY_ALIAS=$KEY_ALIAS_VALUE"
+            echo "KEY_PASSWORD=$KEY_PASSWORD_VALUE"
+          } >> gradle.properties
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Build signed WutongSU manager
+        run: |
+          chmod +x gradlew
+          ./gradlew clean assembleRelease
+
+      - name: Verify and stage APK
+        run: |
+          set -euo pipefail
+          APK="$(find app/build/outputs/apk/release -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/37.0.0/aapt2" dump badging "$APK" | grep "package: name='com.ksuwei.wutong'"
+          unzip -l "$APK" | grep -F 'lib/arm64-v8a/libksud.so'
+          cp "$APK" ../WutongSU-v3.3.0-manager.apk
+
+      - name: Upload WutongSU manager
+        uses: actions/upload-artifact@v7
+        with:
+          name: WutongSU-v3.3.0-manager
+          path: WutongSU-v3.3.0-manager.apk
+          if-no-files-found: error
+
+  build-kmi:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:android16-6.12-20260828
+      options: --privileged
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Build package and certificate bound ARM64 KMI
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cd kernel
+          CONFIG_KSU=m CC=clang make \
+            KSU_MANAGER_PACKAGE=com.ksuwei.wutong \
+            KSU_EXPECTED_SIZE=0x535 \
+            KSU_EXPECTED_HASH=7893e79892ca146c68ceecc51cda0067d3480bf6ed2b217a8b564058d5ecafaa
+          llvm-strip -d kernelsu.ko
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp kernelsu.ko "$GITHUB_WORKSPACE/out/android16-6.12_WutongSU_exclusive_kernelsu.ko"
+          grep -aF 'com.ksuwei.wutong' "$GITHUB_WORKSPACE/out/android16-6.12_WutongSU_exclusive_kernelsu.ko"
+          strings "$GITHUB_WORKSPACE/out/android16-6.12_WutongSU_exclusive_kernelsu.ko" | grep '^vermagic='
+          sha256sum "$GITHUB_WORKSPACE/out/android16-6.12_WutongSU_exclusive_kernelsu.ko"
+
+      - name: Upload WutongSU KMI
+        uses: actions/upload-artifact@v7
+        with:
+          name: WutongSU-android16-6.12-exclusive-kmi
+          path: out/android16-6.12_WutongSU_exclusive_kernelsu.ko
+          if-no-files-found: error

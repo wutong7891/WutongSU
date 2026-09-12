@@ -66,6 +66,7 @@ void on_boot_completed(void)
 {
     ksu_boot_completed = true;
     pr_info("on_boot_completed!\n");
-    track_throne(true);
+    /* Android 16 may not emit a create/move event for packages.list. */
+    track_throne(false);
     ksu_selinux_hide_drop_backup_if_unused();
 }

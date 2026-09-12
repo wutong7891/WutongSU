@@ -9,7 +9,7 @@
 #include "klog.h" // IWYU pragma: keep
 #include "manager/throne_tracker.h"
 
-#define MASK_SYSTEM (FS_CREATE | FS_MOVE | FS_EVENT_ON_CHILD)
+#define MASK_SYSTEM (FS_CREATE | FS_MOVE | FS_MODIFY | FS_CLOSE_WRITE | FS_EVENT_ON_CHILD)
 
 struct watch_dir {
     const char *path;
