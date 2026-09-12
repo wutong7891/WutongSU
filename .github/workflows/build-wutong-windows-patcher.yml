@@ -1,0 +1,20 @@
+name: Build WutongSU Windows image patcher
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ksuinit:
+    uses: ./.github/workflows/ksuinit.yml
+
+  build-windows-patcher:
+    needs: build-ksuinit
+    uses: ./.github/workflows/ksud-extra.yml
+    with:
+      target: x86_64-pc-windows-gnu
+      os: ubuntu-latest
+      pack_lkm: false
+      pack_ksuinit: true
