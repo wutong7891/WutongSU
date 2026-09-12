@@ -1,0 +1,255 @@
+name: Build WutongSU KMI and image patchers
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  validate-ksud:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Setup Rust and cargo-ndk
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk --locked
+
+      - name: Setup Android NDK r29
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Check, lint and format ksud
+        working-directory: userspace/ksud
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a check
+          cargo ndk -t arm64-v8a clippy -- -D warnings
+          cargo fmt --check
+
+  build-ksuinit:
+    uses: ./.github/workflows/ksuinit.yml
+
+  build-kmi:
+    name: Build ${{ matrix.kmi }} WutongSU KMI
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-20260828
+      options: --privileged
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Build certificate-bound ARM64 module
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cd kernel
+          CONFIG_KSU=m CC=clang make \
+            KSU_MANAGER_PACKAGE=com.ksuwei.wutong \
+            KSU_EXPECTED_SIZE=0x336 \
+            KSU_EXPECTED_HASH=f5720eb1effc96e619165ed6a4503946f69c0f7a8680fd3619d93cc1ce0bd91d
+          llvm-strip -d kernelsu.ko
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp kernelsu.ko "$GITHUB_WORKSPACE/out/${{ matrix.kmi }}_kernelsu.ko"
+          grep -aF 'com.ksuwei.wutong' "$GITHUB_WORKSPACE/out/${{ matrix.kmi }}_kernelsu.ko"
+          strings "$GITHUB_WORKSPACE/out/${{ matrix.kmi }}_kernelsu.ko" | grep '^vermagic='
+          sha256sum "$GITHUB_WORKSPACE/out/${{ matrix.kmi }}_kernelsu.ko"
+
+      - name: Upload module
+        uses: actions/upload-artifact@v7
+        with:
+          name: aarch64-${{ matrix.kmi }}-lkm
+          path: out/${{ matrix.kmi }}_kernelsu.ko
+          if-no-files-found: error
+
+  build-android-engine:
+    needs: [validate-ksud, build-ksuinit]
+    uses: ./.github/workflows/ksud.yml
+    with:
+      target: aarch64-linux-android
+      pack_lkm: false
+      pack_ksuinit: true
+
+  build-windows-patcher:
+    name: Build Windows image patcher
+    needs: [validate-ksud, build-ksuinit, build-kmi]
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download KMI and ksuinit artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: downloaded-artifacts
+
+      - name: Prepare embedded assets
+        shell: pwsh
+        run: |
+          $modules = @(
+            Get-ChildItem -LiteralPath downloaded-artifacts -Recurse -File -Filter '*_kernelsu.ko'
+          )
+          if ($modules.Count -ne 8) {
+            throw "Expected 8 WutongSU ARM64 KMI files, found $($modules.Count)"
+          }
+          New-Item -ItemType Directory -Force -Path userspace/ksud/bin/aarch64 | Out-Null
+          foreach ($module in $modules) {
+            Copy-Item -LiteralPath $module.FullName -Destination userspace/ksud/bin/aarch64
+          }
+          Copy-Item -LiteralPath downloaded-artifacts/ksuinit-aarch64/ksuinit `
+            -Destination userspace/ksud/bin/aarch64/ksuinit
+
+      - name: Setup Rust
+        shell: pwsh
+        run: rustup update stable
+
+      - name: Assemble AArch64 bootstrap
+        shell: pwsh
+        run: |
+          clang.exe --target=aarch64-linux-gnu -c -nostdlib `
+            -o userspace/ksud/.lkm_image_bootstrap.o `
+            userspace/ksud/src/lkm_image_bootstrap.S
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to assemble AArch64 bootstrap' }
+
+      - name: Build Windows patcher
+        shell: pwsh
+        run: cargo build --release --manifest-path userspace/ksud/Cargo.toml
+
+      - name: Verify eight embedded KMI files
+        shell: pwsh
+        run: |
+          $output = & target/release/ksud.exe supported-kmis
+          if ($LASTEXITCODE -ne 0) { throw 'Patcher self-test failed' }
+          $expected = @(
+            'android12-5.10', 'android13-5.10', 'android13-5.15',
+            'android14-5.15', 'android14-6.1', 'android15-6.6',
+            'android16-6.12', 'android17-6.18'
+          )
+          foreach ($kmi in $expected) {
+            if (($output -join "`n") -notmatch [regex]::Escape($kmi)) {
+              throw "Windows patcher does not contain $kmi"
+            }
+          }
+          if ($output.Count -ne 8) {
+            throw "Expected exactly 8 embedded KMI files, found $($output.Count)"
+          }
+          & target/release/ksud.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Patcher help self-test failed' }
+
+      - name: Package Windows patcher
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -LiteralPath target/release/ksud.exe -Destination 'dist/WutongSU镜像工坊.exe'
+
+      - name: Upload Windows patcher
+        uses: actions/upload-artifact@v7
+        with:
+          name: WutongSU-image-patcher-windows-x64
+          path: dist/WutongSU镜像工坊.exe
+          if-no-files-found: error
+
+  build-android-patcher:
+    name: Build Android image patcher
+    needs: [build-kmi, build-android-engine]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Download KMI and Android engine artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: downloaded-artifacts
+
+      - name: Prepare embedded assets
+        run: |
+          set -euo pipefail
+          mkdir -p android-image-patcher/app/src/main/assets/kmi
+          mkdir -p android-image-patcher/app/src/main/jniLibs/arm64-v8a
+          find downloaded-artifacts -type f -name '*_kernelsu.ko' -exec cp {} android-image-patcher/app/src/main/assets/kmi/ \;
+          test "$(find android-image-patcher/app/src/main/assets/kmi -type f -name '*_kernelsu.ko' | wc -l)" -eq 8
+          cp downloaded-artifacts/ksud-aarch64-linux-android/ksud \
+            android-image-patcher/app/src/main/jniLibs/arm64-v8a/libwutongsupatcher.so
+          test -s android-image-patcher/app/src/main/jniLibs/arm64-v8a/libwutongsupatcher.so
+
+      - name: Restore signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE }}
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS_VALUE: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD_VALUE: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_BASE64"
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > android-image-patcher/patcher.jks
+          {
+            echo 'storeFile=patcher.jks'
+            echo "storePassword=$STORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS_VALUE"
+            echo "keyPassword=$KEY_PASSWORD_VALUE"
+          } > android-image-patcher/keystore.properties
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Build signed release APK
+        working-directory: android-image-patcher
+        run: |
+          chmod +x gradlew
+          ./gradlew clean assembleRelease
+
+      - name: Verify and stage APK
+        run: |
+          set -euo pipefail
+          APK="$(find android-image-patcher/app/build/outputs/apk/release -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/37.0.0/aapt2" dump badging "$APK" | grep "package: name='com.ksuwei.wutong.patcher'"
+          unzip -l "$APK" | grep -F 'lib/arm64-v8a/libwutongsupatcher.so'
+          test "$(unzip -Z1 "$APK" | grep -c '^assets/kmi/.*_kernelsu.ko$')" -eq 8
+          mkdir -p dist
+          cp "$APK" dist/WutongSU-image-patcher-arm64.apk
+
+      - name: Upload Android patcher
+        uses: actions/upload-artifact@v7
+        with:
+          name: WutongSU-image-patcher-android-arm64
+          path: dist/WutongSU-image-patcher-arm64.apk
+          if-no-files-found: error
