@@ -108,8 +108,19 @@ jobs:
           ./gradlew clean assembleRelease
 
       - name: Verify and stage APK
+        env:
+          STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS_VALUE: ${{ secrets.KEY_ALIAS }}
         run: |
           set -euo pipefail
+          keytool -exportcert \
+            -alias "$KEY_ALIAS_VALUE" \
+            -keystore key.jks \
+            -storepass "$STORE_PASSWORD" \
+            -file manager-cert.der
+          test "$(stat -c%s manager-cert.der)" -eq 822
+          test "$(sha256sum manager-cert.der | awk '{print $1}')" = \
+            "f5720eb1effc96e619165ed6a4503946f69c0f7a8680fd3619d93cc1ce0bd91d"
           APK="$(find app/build/outputs/apk/release -type f -name '*.apk' | head -n 1)"
           test -n "$APK"
           "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --verbose --print-certs "$APK"
@@ -142,8 +153,8 @@ jobs:
           cd kernel
           CONFIG_KSU=m CC=clang make \
             KSU_MANAGER_PACKAGE=com.ksuwei.wutong \
-            KSU_EXPECTED_SIZE=0x535 \
-            KSU_EXPECTED_HASH=7893e79892ca146c68ceecc51cda0067d3480bf6ed2b217a8b564058d5ecafaa
+            KSU_EXPECTED_SIZE=0x336 \
+            KSU_EXPECTED_HASH=f5720eb1effc96e619165ed6a4503946f69c0f7a8680fd3619d93cc1ce0bd91d
           llvm-strip -d kernelsu.ko
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp kernelsu.ko "$GITHUB_WORKSPACE/out/android16-6.12_WutongSU_exclusive_kernelsu.ko"
